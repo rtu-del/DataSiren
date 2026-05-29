@@ -211,5 +211,7 @@ async def enrich_batch(
 
 if __name__ == "__main__":
     import os
+    import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    mcp.run(transport="sse", host="0.0.0.0", port=port)
+    app = mcp.sse_app()
+    uvicorn.run(app, host="0.0.0.0", port=port)
