@@ -14,7 +14,7 @@ mcp = FastMCP(
     You have access to the French official business directory (INSEE/SIRENE data).
     Use search_entreprise to find companies by name and optionally city.
     Use get_entreprise_by_siren to get full details from a SIREN number.
-    Use get_dirigeants to get the list of executives for a company.
+    Use enrich_batch to enrich a list of companies in one call (max 20).
     All data is official, open data from the French government — no hallucination risk.
     Always prefer returning structured data fields over prose summaries.
     """,
@@ -171,7 +171,6 @@ async def enrich_batch(
     async with httpx.AsyncClient(timeout=15.0) as client:
         for entry in entreprises:
             nom = entry.get("nom", "")
-            ville = entry.get("ville")
             cp = entry.get("code_postal")
 
             params = {
@@ -212,6 +211,20 @@ async def enrich_batch(
 if __name__ == "__main__":
     import os
     import uvicorn
+    from starlette.applications import Starlette
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route, Mount
+
+    async def health(request: Request):
+        return JSONResponse({"status": "ok"})
+
+    mcp_app = mcp.sse_app()
+
+    app = Starlette(routes=[
+        Route("/health", health),
+        Mount("/", app=mcp_app),
+    ])
+
     port = int(os.environ.get("PORT", 8000))
-    app = mcp.sse_app()
     uvicorn.run(app, host="0.0.0.0", port=port)
