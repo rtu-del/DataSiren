@@ -1,7 +1,7 @@
 """
 MCP Server — Annuaire Entreprises France
 API source : recherche-entreprises.api.gouv.fr (open data, no key required)
-Transport  : HTTP/SSE + OAuth2 client_credentials for Claude.ai MCP connector
+Transport  : HTTP/SSE + OAuth2 client_credentials (Claude.ai compatible)
 """
 
 import os
@@ -15,17 +15,9 @@ from starlette.routing import Route, Mount
 from starlette.middleware.base import BaseHTTPMiddleware
 
 # ── Auth config ────────────────────────────────────────────────────────────────
-# Set these in Railway environment variables:
-#   MCP_CLIENT_ID     e.g. "datasiren"
-#   MCP_CLIENT_SECRET e.g. "my-secret-key"
-# Claude.ai will POST /oauth/token with these to get a Bearer token,
-# then send Authorization: Bearer <token> on every MCP request.
-
 CLIENT_ID     = os.environ.get("MCP_CLIENT_ID", "datasiren")
-CLIENT_SECRET = os.environ.get("MCP_CLIENT_SECRET", "")  # empty = no auth
-
-# We use the secret itself as the token (stateless, simple)
-VALID_TOKEN = CLIENT_SECRET
+CLIENT_SECRET = os.environ.get("MCP_CLIENT_SECRET", "")
+VALID_TOKEN   = CLIENT_SECRET  # stateless: secret = token
 
 # ── MCP server ─────────────────────────────────────────────────────────────────
 mcp = FastMCP(
@@ -47,7 +39,6 @@ def _format_entreprise(org: dict) -> dict:
     siege = org.get("siege", {}) or {}
     matching = org.get("matching_etablissements", [])
     best_etab = matching[0] if matching else siege
-
     return {
         "siren": org.get("siren"),
         "nom": org.get("nom_complet") or org.get("nom_raison_sociale"),
@@ -106,20 +97,15 @@ async def search_entreprise(
         ville: City name to narrow results (e.g. "Montgeron")
         code_postal: Postal code filter (e.g. "91230")
         code_naf: NAF/APE activity code (e.g. "1413Z")
-        limite: Max results (1-25, default 5)
+        limite: Max results 1-25, default 5
     """
     params = {
-        "q": nom,
-        "page": 1,
-        "per_page": min(limite, 25),
+        "q": nom, "page": 1, "per_page": min(limite, 25),
         "include": "siege,matching_etablissements,dirigeants,finances",
     }
-    if code_postal:
-        params["code_postal"] = code_postal
-    if ville:
-        params["commune"] = ville
-    if code_naf:
-        params["activite_principale"] = code_naf
+    if code_postal: params["code_postal"] = code_postal
+    if ville: params["commune"] = ville
+    if code_naf: params["activite_principale"] = code_naf
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(f"{BASE_URL}/search", params=params)
@@ -152,7 +138,6 @@ async def get_entreprise_by_siren(siren: str) -> dict:
         )
         resp.raise_for_status()
         data = resp.json()
-
     results = data.get("results", [])
     if not results:
         return {"error": f"No company found for SIREN {siren}"}
@@ -166,7 +151,7 @@ async def enrich_batch(entreprises: list[dict]) -> dict:
     Returns best match per company, or found=false if not found.
 
     Args:
-        entreprises: List of dicts — e.g. [{"nom": "GAINERIE 91", "code_postal": "91230"}, ...]
+        entreprises: e.g. [{"nom": "GAINERIE 91", "code_postal": "91230"}, ...]
                      Maximum 20 entries per call.
     """
     if len(entreprises) > 20:
@@ -179,8 +164,7 @@ async def enrich_batch(entreprises: list[dict]) -> dict:
             cp = entry.get("code_postal")
             params = {"q": nom, "page": 1, "per_page": 1,
                       "include": "siege,matching_etablissements,dirigeants,finances"}
-            if cp:
-                params["code_postal"] = cp
+            if cp: params["code_postal"] = cp
             try:
                 resp = await client.get(f"{BASE_URL}/search", params=params)
                 resp.raise_for_status()
@@ -198,15 +182,12 @@ async def enrich_batch(entreprises: list[dict]) -> dict:
 
 
 # ── Auth middleware ────────────────────────────────────────────────────────────
+BYPASS_PATHS = {"/health", "/oauth/token", "/.well-known/oauth-authorization-server"}
+
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        # Skip auth for health check and token endpoint
-        if request.url.path in ("/health", "/oauth/token"):
+        if request.url.path in BYPASS_PATHS or not VALID_TOKEN:
             return await call_next(request)
-        # Skip auth if no secret configured
-        if not VALID_TOKEN:
-            return await call_next(request)
-        # Validate Bearer token
         auth = request.headers.get("Authorization", "")
         token = auth.replace("Bearer ", "").strip()
         if token != VALID_TOKEN:
@@ -214,20 +195,31 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-# ── OAuth2 token endpoint ──────────────────────────────────────────────────────
+# ── OAuth2 endpoints ───────────────────────────────────────────────────────────
+async def oauth_discovery(request: Request):
+    """OAuth2 Authorization Server Metadata (RFC 8414) — Claude.ai auto-discovers this."""
+    base = str(request.base_url).rstrip("/")
+    return JSONResponse({
+        "issuer": base,
+        "token_endpoint": f"{base}/oauth/token",
+        "grant_types_supported": ["client_credentials"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post"],
+    })
+
+
 async def oauth_token(request: Request):
-    """
-    OAuth2 client_credentials flow.
-    Claude.ai posts client_id + client_secret and gets back a Bearer token.
-    """
+    """OAuth2 client_credentials token endpoint."""
     try:
         body = await request.form()
         client_id = body.get("client_id", "")
         client_secret = body.get("client_secret", "")
     except Exception:
-        body = await request.json()
-        client_id = body.get("client_id", "")
-        client_secret = body.get("client_secret", "")
+        try:
+            body = await request.json()
+            client_id = body.get("client_id", "")
+            client_secret = body.get("client_secret", "")
+        except Exception:
+            return JSONResponse({"error": "invalid_request"}, status_code=400)
 
     if client_id == CLIENT_ID and client_secret == CLIENT_SECRET:
         return JSONResponse({
@@ -250,10 +242,10 @@ if __name__ == "__main__":
 
     app = Starlette(routes=[
         Route("/health", health),
+        Route("/.well-known/oauth-authorization-server", oauth_discovery),
         Route("/oauth/token", oauth_token, methods=["POST"]),
         Mount("/", app=mcp_app),
     ])
-
     app.add_middleware(BearerAuthMiddleware)
 
     port = int(os.environ.get("PORT", 8000))
