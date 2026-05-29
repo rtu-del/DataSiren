@@ -1,22 +1,42 @@
 """
 MCP Server — Annuaire Entreprises France
 API source : recherche-entreprises.api.gouv.fr (open data, no key required)
-Transport  : HTTP/SSE via FastMCP for remote deployment
+Transport  : HTTP/SSE + OAuth2 client_credentials for Claude.ai MCP connector
 """
 
+import os
 import httpx
 from typing import Optional
 from mcp.server.fastmcp import FastMCP
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route, Mount
+from starlette.middleware.base import BaseHTTPMiddleware
 
+# ── Auth config ────────────────────────────────────────────────────────────────
+# Set these in Railway environment variables:
+#   MCP_CLIENT_ID     e.g. "datasiren"
+#   MCP_CLIENT_SECRET e.g. "my-secret-key"
+# Claude.ai will POST /oauth/token with these to get a Bearer token,
+# then send Authorization: Bearer <token> on every MCP request.
+
+CLIENT_ID     = os.environ.get("MCP_CLIENT_ID", "datasiren")
+CLIENT_SECRET = os.environ.get("MCP_CLIENT_SECRET", "")  # empty = no auth
+
+# We use the secret itself as the token (stateless, simple)
+VALID_TOKEN = CLIENT_SECRET
+
+# ── MCP server ─────────────────────────────────────────────────────────────────
 mcp = FastMCP(
     name="annuaire-entreprises-fr",
     instructions="""
     You have access to the French official business directory (INSEE/SIRENE data).
-    Use search_entreprise to find companies by name and optionally city.
+    Use search_entreprise to find companies by name and optionally city/postal code.
     Use get_entreprise_by_siren to get full details from a SIREN number.
-    Use enrich_batch to enrich a list of companies in one call (max 20).
-    All data is official, open data from the French government — no hallucination risk.
-    Always prefer returning structured data fields over prose summaries.
+    Use enrich_batch to enrich up to 20 companies in one call.
+    All data is official open data from the French government.
+    Always return structured data fields, never hallucinate company info.
     """,
 )
 
@@ -24,7 +44,6 @@ BASE_URL = "https://recherche-entreprises.api.gouv.fr"
 
 
 def _format_entreprise(org: dict) -> dict:
-    """Extract and structure the most useful fields for Claude."""
     siege = org.get("siege", {}) or {}
     matching = org.get("matching_etablissements", [])
     best_etab = matching[0] if matching else siege
@@ -80,15 +99,14 @@ async def search_entreprise(
     limite: int = 5,
 ) -> dict:
     """
-    Search for French companies by name (and optionally city/postal code/NAF code).
-    Returns structured data ready for enrichment or analysis.
+    Search French companies by name, optionally filtered by city/postal code/NAF.
 
     Args:
         nom: Company name or keywords (e.g. "GAINERIE 91", "couture Cholet")
-        ville: City name to narrow down results (e.g. "Montgeron")
-        code_postal: Postal code to narrow down results (e.g. "91230")
-        code_naf: NAF/APE activity code filter (e.g. "1413Z" for outerwear)
-        limite: Max number of results (1-25, default 5)
+        ville: City name to narrow results (e.g. "Montgeron")
+        code_postal: Postal code filter (e.g. "91230")
+        code_naf: NAF/APE activity code (e.g. "1413Z")
+        limite: Max results (1-25, default 5)
     """
     params = {
         "q": nom,
@@ -109,10 +127,8 @@ async def search_entreprise(
         data = resp.json()
 
     results = data.get("results", [])
-    total = data.get("total_results", 0)
-
     return {
-        "total_found": total,
+        "total_found": data.get("total_results", 0),
         "returned": len(results),
         "query": {"nom": nom, "ville": ville, "code_postal": code_postal},
         "entreprises": [_format_entreprise(r) for r in results],
@@ -122,109 +138,123 @@ async def search_entreprise(
 @mcp.tool()
 async def get_entreprise_by_siren(siren: str) -> dict:
     """
-    Get full details for a French company using its SIREN number (9 digits).
-    Returns official INSEE/SIRENE data: address, executives, NAF code, financials.
+    Get full details for a French company by SIREN number (9 digits).
 
     Args:
-        siren: 9-digit SIREN number (e.g. "552032534")
+        siren: 9-digit SIREN (e.g. "552032534")
     """
     siren_clean = siren.replace(" ", "").replace("-", "")
-
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
             f"{BASE_URL}/search",
-            params={
-                "q": siren_clean,
-                "page": 1,
-                "per_page": 1,
-                "include": "siege,matching_etablissements,dirigeants,finances",
-            },
+            params={"q": siren_clean, "page": 1, "per_page": 1,
+                    "include": "siege,matching_etablissements,dirigeants,finances"},
         )
         resp.raise_for_status()
         data = resp.json()
 
     results = data.get("results", [])
     if not results:
-        return {"error": f"Aucune entreprise trouvée pour le SIREN {siren}"}
-
+        return {"error": f"No company found for SIREN {siren}"}
     return _format_entreprise(results[0])
 
 
 @mcp.tool()
-async def enrich_batch(
-    entreprises: list[dict],
-) -> dict:
+async def enrich_batch(entreprises: list[dict]) -> dict:
     """
-    Enrich a batch of companies from a list of {nom, ville?, code_postal?} dicts.
-    Returns one match per company (best match), or null if not found.
-    Ideal for enriching CSV/spreadsheet data.
+    Enrich a batch of up to 20 companies from a list of {nom, ville?, code_postal?}.
+    Returns best match per company, or found=false if not found.
 
     Args:
-        entreprises: List of dicts with keys: nom (required), ville (optional), code_postal (optional)
-                     Example: [{"nom": "GAINERIE 91", "code_postal": "91230"}, ...]
-                     Max 20 per call.
+        entreprises: List of dicts — e.g. [{"nom": "GAINERIE 91", "code_postal": "91230"}, ...]
+                     Maximum 20 entries per call.
     """
     if len(entreprises) > 20:
-        return {"error": "Maximum 20 entreprises per batch call."}
+        return {"error": "Maximum 20 companies per batch call."}
 
     enriched = []
     async with httpx.AsyncClient(timeout=15.0) as client:
         for entry in entreprises:
             nom = entry.get("nom", "")
             cp = entry.get("code_postal")
-
-            params = {
-                "q": nom,
-                "page": 1,
-                "per_page": 1,
-                "include": "siege,matching_etablissements,dirigeants,finances",
-            }
+            params = {"q": nom, "page": 1, "per_page": 1,
+                      "include": "siege,matching_etablissements,dirigeants,finances"}
             if cp:
                 params["code_postal"] = cp
-
             try:
                 resp = await client.get(f"{BASE_URL}/search", params=params)
                 resp.raise_for_status()
-                data = resp.json()
-                results = data.get("results", [])
-
+                results = resp.json().get("results", [])
                 if results:
-                    enriched.append({
-                        "input": entry,
-                        "found": True,
-                        "data": _format_entreprise(results[0]),
-                    })
+                    enriched.append({"input": entry, "found": True, "data": _format_entreprise(results[0])})
                 else:
                     enriched.append({"input": entry, "found": False, "data": None})
             except Exception as e:
                 enriched.append({"input": entry, "found": False, "error": str(e), "data": None})
 
     found_count = sum(1 for e in enriched if e["found"])
-    return {
-        "total": len(enriched),
-        "found": found_count,
-        "not_found": len(enriched) - found_count,
-        "results": enriched,
-    }
+    return {"total": len(enriched), "found": found_count,
+            "not_found": len(enriched) - found_count, "results": enriched}
 
 
+# ── Auth middleware ────────────────────────────────────────────────────────────
+class BearerAuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Skip auth for health check and token endpoint
+        if request.url.path in ("/health", "/oauth/token"):
+            return await call_next(request)
+        # Skip auth if no secret configured
+        if not VALID_TOKEN:
+            return await call_next(request)
+        # Validate Bearer token
+        auth = request.headers.get("Authorization", "")
+        token = auth.replace("Bearer ", "").strip()
+        if token != VALID_TOKEN:
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+        return await call_next(request)
+
+
+# ── OAuth2 token endpoint ──────────────────────────────────────────────────────
+async def oauth_token(request: Request):
+    """
+    OAuth2 client_credentials flow.
+    Claude.ai posts client_id + client_secret and gets back a Bearer token.
+    """
+    try:
+        body = await request.form()
+        client_id = body.get("client_id", "")
+        client_secret = body.get("client_secret", "")
+    except Exception:
+        body = await request.json()
+        client_id = body.get("client_id", "")
+        client_secret = body.get("client_secret", "")
+
+    if client_id == CLIENT_ID and client_secret == CLIENT_SECRET:
+        return JSONResponse({
+            "access_token": VALID_TOKEN,
+            "token_type": "bearer",
+            "expires_in": 86400,
+        })
+    return JSONResponse({"error": "invalid_client"}, status_code=401)
+
+
+async def health(request: Request):
+    return JSONResponse({"status": "ok"})
+
+
+# ── App assembly ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import os
     import uvicorn
-    from starlette.applications import Starlette
-    from starlette.requests import Request
-    from starlette.responses import JSONResponse
-    from starlette.routing import Route, Mount
-
-    async def health(request: Request):
-        return JSONResponse({"status": "ok"})
 
     mcp_app = mcp.sse_app()
 
     app = Starlette(routes=[
         Route("/health", health),
+        Route("/oauth/token", oauth_token, methods=["POST"]),
         Mount("/", app=mcp_app),
     ])
+
+    app.add_middleware(BearerAuthMiddleware)
 
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
