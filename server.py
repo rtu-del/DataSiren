@@ -1,10 +1,10 @@
 """
 MCP Server — Annuaire Entreprises France
-API source : recherche-entreprises.api.gouv.fr (open data, no key required)
-Transport  : Streamable HTTP (authless, Claude.ai compatible)
+Transport : Streamable HTTP stateless (production-ready, authless)
 """
 
 import os
+import contextlib
 import httpx
 from typing import Optional
 from mcp.server.fastmcp import FastMCP
@@ -13,14 +13,17 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route, Mount
 
+# Stateless + JSON responses = optimal for Railway (no session state needed)
 mcp = FastMCP(
     name="annuaire-entreprises-fr",
+    stateless_http=True,
+    json_response=True,
     instructions="""
-    French official business directory (INSEE/SIRENE open data, no hallucination risk).
+    French official business directory (INSEE/SIRENE open data).
     - search_entreprise: find companies by name + optional city/postal code
     - get_entreprise_by_siren: full details by SIREN number
-    - enrich_batch: enrich up to 20 companies in one call [{nom, ville?, code_postal?}]
-    Always use these tools — never invent company data.
+    - enrich_batch: enrich up to 20 companies in one call
+    Never hallucinate company data — always use these tools.
     """,
 )
 
@@ -85,10 +88,10 @@ async def search_entreprise(
     Search French companies by name, optionally filtered by city/postal code/NAF.
 
     Args:
-        nom: Company name or keywords (e.g. "GAINERIE 91", "couture Cholet")
+        nom: Company name (e.g. "GAINERIE 91", "couture Cholet")
         ville: City name (e.g. "Montgeron")
         code_postal: Postal code (e.g. "91230")
-        code_naf: NAF/APE activity code (e.g. "1413Z")
+        code_naf: NAF/APE code (e.g. "1413Z")
         limite: Max results 1-25, default 5
     """
     params = {
@@ -139,8 +142,8 @@ async def get_entreprise_by_siren(siren: str) -> dict:
 @mcp.tool()
 async def enrich_batch(entreprises: list[dict]) -> dict:
     """
-    Enrich up to 20 companies from a list of {nom, ville?, code_postal?}.
-    Returns best match per company, or found=false if not found.
+    Enrich up to 20 companies from [{nom, ville?, code_postal?}].
+    Returns best match per entry, or found=false if not found.
 
     Args:
         entreprises: e.g. [{"nom": "GAINERIE 91", "code_postal": "91230"}, ...]
@@ -175,19 +178,28 @@ async def enrich_batch(entreprises: list[dict]) -> dict:
             "not_found": len(enriched) - found_count, "results": enriched}
 
 
+# ── App assembly ───────────────────────────────────────────────────────────────
+@contextlib.asynccontextmanager
+async def lifespan(app: Starlette):
+    async with mcp.session_manager.run():
+        yield
+
+
 async def health(request: Request):
     return JSONResponse({"status": "ok"})
 
 
+mcp_app = mcp.streamable_http_app()
+
+app = Starlette(
+    lifespan=lifespan,
+    routes=[
+        Route("/health", health),
+        Mount("/mcp", app=mcp_app),
+    ],
+)
+
 if __name__ == "__main__":
     import uvicorn
-
-    mcp_app = mcp.sse_app()
-
-    app = Starlette(routes=[
-        Route("/health", health),
-        Mount("/", app=mcp_app),
-    ])
-
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
