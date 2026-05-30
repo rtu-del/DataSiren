@@ -1,6 +1,7 @@
 """
 MCP Server — Annuaire Entreprises France
 Transport : Streamable HTTP stateless (production-ready, authless)
+v4
 """
 
 import os
