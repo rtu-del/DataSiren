@@ -1,20 +1,14 @@
 """
 MCP Server — Annuaire Entreprises France
-Transport : Streamable HTTP stateless (production-ready, authless)
-v4
+Transport : Streamable HTTP stateless (authless, Claude.ai compatible)
+v5
 """
 
 import os
-import contextlib
 import httpx
 from typing import Optional
 from mcp.server.fastmcp import FastMCP
-from starlette.applications import Starlette
-from starlette.requests import Request
-from starlette.responses import JSONResponse
-from starlette.routing import Route, Mount
 
-# Stateless + JSON responses = optimal for Railway (no session state needed)
 mcp = FastMCP(
     name="annuaire-entreprises-fr",
     stateless_http=True,
@@ -179,28 +173,6 @@ async def enrich_batch(entreprises: list[dict]) -> dict:
             "not_found": len(enriched) - found_count, "results": enriched}
 
 
-# ── App assembly ───────────────────────────────────────────────────────────────
-@contextlib.asynccontextmanager
-async def lifespan(app: Starlette):
-    async with mcp.session_manager.run():
-        yield
-
-
-async def health(request: Request):
-    return JSONResponse({"status": "ok"})
-
-
-mcp_app = mcp.streamable_http_app()
-
-app = Starlette(
-    lifespan=lifespan,
-    routes=[
-        Route("/health", health),
-        Mount("/mcp", app=mcp_app),
-    ],
-)
-
 if __name__ == "__main__":
-    import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
