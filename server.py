@@ -4,7 +4,9 @@ Transport : Streamable HTTP stateless (authless, Claude.ai compatible)
 v5
 """
 
+import os
 import httpx
+import uvicorn
 from typing import Optional
 from mcp.server.fastmcp import FastMCP
 
@@ -185,4 +187,5 @@ async def enrich_batch(entreprises: list[dict]) -> dict:
 
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(mcp.streamable_http_app(), host="0.0.0.0", port=port)
