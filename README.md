@@ -39,7 +39,7 @@ Railway détecte automatiquement le Dockerfile et expose le service sur une URL 
 Dans les paramètres MCP de Claude.ai, ajouter :
 
 ```
-URL : https://ton-service.railway.app/sse
+URL : https://ton-service.railway.app/mcp
 Nom : annuaire-entreprises-fr
 ```
 
@@ -62,5 +62,5 @@ Pour chaque entreprise, le MCP retourne :
 ```bash
 pip install -r requirements.txt
 python server.py
-# Serveur SSE disponible sur http://localhost:8000/sse
+# Serveur Streamable HTTP disponible sur http://localhost:8000/mcp
 ```

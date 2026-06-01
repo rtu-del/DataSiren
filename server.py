@@ -25,6 +25,13 @@ mcp = FastMCP(
 BASE_URL = "https://recherche-entreprises.api.gouv.fr"
 
 
+def _normalize_naf(code_naf: str) -> str:
+    code = code_naf.strip().upper()
+    if len(code) == 5 and code[:4].isdigit() and code[4].isalpha():
+        return f"{code[:2]}.{code[2:]}"
+    return code
+
+
 def _format_entreprise(org: dict) -> dict:
     siege = org.get("siege", {}) or {}
     matching = org.get("matching_etablissements", [])
@@ -89,13 +96,14 @@ async def search_entreprise(
         code_naf: NAF/APE code (e.g. "1413Z")
         limite: Max results 1-25, default 5
     """
+    query = f"{nom} {ville}".strip() if ville else nom
     params = {
-        "q": nom, "page": 1, "per_page": min(limite, 25),
+        "q": query, "page": 1, "per_page": min(limite, 25),
+        "minimal": "true",
         "include": "siege,matching_etablissements,dirigeants,finances",
     }
     if code_postal: params["code_postal"] = code_postal
-    if ville: params["commune"] = ville
-    if code_naf: params["activite_principale"] = code_naf
+    if code_naf: params["activite_principale"] = _normalize_naf(code_naf)
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(f"{BASE_URL}/search", params=params)
@@ -124,6 +132,7 @@ async def get_entreprise_by_siren(siren: str) -> dict:
         resp = await client.get(
             f"{BASE_URL}/search",
             params={"q": siren_clean, "page": 1, "per_page": 1,
+                    "minimal": "true",
                     "include": "siege,matching_etablissements,dirigeants,finances"},
         )
         resp.raise_for_status()
@@ -152,7 +161,10 @@ async def enrich_batch(entreprises: list[dict]) -> dict:
         for entry in entreprises:
             nom = entry.get("nom", "")
             cp = entry.get("code_postal")
-            params = {"q": nom, "page": 1, "per_page": 1,
+            ville = entry.get("ville")
+            query = f"{nom} {ville}".strip() if ville else nom
+            params = {"q": query, "page": 1, "per_page": 1,
+                      "minimal": "true",
                       "include": "siege,matching_etablissements,dirigeants,finances"}
             if cp: params["code_postal"] = cp
             try:
@@ -175,4 +187,4 @@ async def enrich_batch(entreprises: list[dict]) -> dict:
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
+    mcp.run(transport="streamable-http", port=port)
