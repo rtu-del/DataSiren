@@ -4,7 +4,6 @@ Transport : Streamable HTTP stateless (authless, Claude.ai compatible)
 v5
 """
 
-import os
 import httpx
 from typing import Optional
 from mcp.server.fastmcp import FastMCP
@@ -186,5 +185,4 @@ async def enrich_batch(entreprises: list[dict]) -> dict:
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    mcp.run(transport="streamable-http", port=port)
+    mcp.run(transport="streamable-http")
