@@ -22,6 +22,7 @@ mcp = FastMCP(
     Never hallucinate company data — always use these tools.
     """,
 )
+mcp_app = mcp.streamable_http_app()
 
 BASE_URL = "https://recherche-entreprises.api.gouv.fr"
 
@@ -186,6 +187,23 @@ async def enrich_batch(entreprises: list[dict]) -> dict:
             "not_found": len(enriched) - found_count, "results": enriched}
 
 
+async def app(scope, receive, send):
+    if scope["type"] == "http" and scope.get("path") == "/health":
+        body = b'{"status":"ok"}'
+        await send({
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode("ascii")),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+        return
+
+    await mcp_app(scope, receive, send)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(mcp.streamable_http_app(), host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port)
