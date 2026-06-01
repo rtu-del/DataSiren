@@ -9,11 +9,15 @@ import httpx
 import uvicorn
 from typing import Optional
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 mcp = FastMCP(
     name="annuaire-entreprises-fr",
     stateless_http=True,
     json_response=True,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+    ),
     instructions="""
     French official business directory (INSEE/SIRENE open data).
     - search_entreprise: find companies by name + optional city/postal code
