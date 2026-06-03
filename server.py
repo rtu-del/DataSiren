@@ -1,13 +1,13 @@
 """
-MCP Server — Annuaire Entreprises France
+MCP Server — Donnees ouvertes France
 Transport : Streamable HTTP stateless (authless, Claude.ai compatible)
-v5
+v6
 """
 
 import os
 import httpx
 import uvicorn
-from typing import Optional
+from typing import Any, Optional
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
@@ -19,16 +19,25 @@ mcp = FastMCP(
         enable_dns_rebinding_protection=False,
     ),
     instructions="""
-    French official business directory (INSEE/SIRENE open data).
+    French official open data tools for companies and geocoding.
     - search_entreprise: find companies by name + optional city/postal code
     - get_entreprise_by_siren: full details by SIREN number
     - enrich_batch: enrich up to 20 companies in one call
-    Never hallucinate company data — always use these tools.
+    - geocode_address: get coordinates from an address/place/parcel
+    - reverse_geocode: get the nearest address/place/parcel from coordinates
+    Never hallucinate company or address data — always use these tools.
     """,
 )
 mcp_app = mcp.streamable_http_app()
 
-BASE_URL = "https://recherche-entreprises.api.gouv.fr"
+ENTREPRISES_BASE_URL = "https://recherche-entreprises.api.gouv.fr"
+FR_GEOCODING_BASE_URL = os.environ.get(
+    "FR_GEOCODING_BASE_URL",
+    "https://data.geopf.fr/geocodage",
+).rstrip("/")
+NOMINATIM_BASE_URL = os.environ.get("NOMINATIM_BASE_URL", "").rstrip("/")
+NOMINATIM_USER_AGENT = os.environ.get("NOMINATIM_USER_AGENT", "")
+MAX_GEOCODING_RESULTS = 50
 
 
 def _normalize_naf(code_naf: str) -> str:
@@ -84,6 +93,75 @@ def _format_entreprise(org: dict) -> dict:
     }
 
 
+def _bounded_limit(value: int, default: int, maximum: int) -> int:
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        limit = default
+    return max(1, min(limit, maximum))
+
+
+def _compact_params(params: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in params.items() if value not in (None, "")}
+
+
+def _format_geoplateforme_feature(feature: dict) -> dict:
+    geometry = feature.get("geometry") or {}
+    properties = feature.get("properties") or {}
+    coordinates = geometry.get("coordinates") or [None, None]
+    longitude = coordinates[0] if len(coordinates) > 0 else None
+    latitude = coordinates[1] if len(coordinates) > 1 else None
+
+    return {
+        "source": "geoplateforme",
+        "id": properties.get("id") or properties.get("banId"),
+        "label": properties.get("label") or properties.get("name"),
+        "type": properties.get("type"),
+        "score": properties.get("score"),
+        "latitude": latitude,
+        "longitude": longitude,
+        "distance_m": properties.get("distance"),
+        "adresse": {
+            "numero": properties.get("housenumber"),
+            "rue": properties.get("street"),
+            "code_postal": properties.get("postcode"),
+            "ville": properties.get("city"),
+            "code_insee": properties.get("citycode"),
+            "arrondissement": properties.get("district"),
+            "contexte": properties.get("context"),
+            "departement": properties.get("depcode"),
+        },
+        "index": properties.get("_type"),
+        "raw_properties": properties,
+    }
+
+
+def _format_nominatim_place(place: dict) -> dict:
+    address = place.get("address") or {}
+    return {
+        "source": "nominatim",
+        "id": place.get("place_id") or place.get("osm_id"),
+        "label": place.get("display_name") or place.get("name"),
+        "type": place.get("type"),
+        "class": place.get("class"),
+        "score": place.get("importance"),
+        "latitude": float(place["lat"]) if place.get("lat") else None,
+        "longitude": float(place["lon"]) if place.get("lon") else None,
+        "adresse": address,
+        "raw_properties": place,
+    }
+
+
+def _nominatim_config_error() -> dict:
+    return {
+        "error": "Global geocoding is not configured.",
+        "details": (
+            "Set NOMINATIM_BASE_URL and NOMINATIM_USER_AGENT to a self-hosted "
+            "or deliberately approved Nominatim-compatible service."
+        ),
+    }
+
+
 @mcp.tool()
 async def search_entreprise(
     nom: str,
@@ -112,7 +190,7 @@ async def search_entreprise(
     if code_naf: params["activite_principale"] = _normalize_naf(code_naf)
 
     async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(f"{BASE_URL}/search", params=params)
+        resp = await client.get(f"{ENTREPRISES_BASE_URL}/search", params=params)
         resp.raise_for_status()
         data = resp.json()
 
@@ -136,7 +214,7 @@ async def get_entreprise_by_siren(siren: str) -> dict:
     siren_clean = siren.replace(" ", "").replace("-", "")
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.get(
-            f"{BASE_URL}/search",
+            f"{ENTREPRISES_BASE_URL}/search",
             params={"q": siren_clean, "page": 1, "per_page": 1,
                     "minimal": "true",
                     "include": "siege,matching_etablissements,dirigeants,finances"},
@@ -174,7 +252,7 @@ async def enrich_batch(entreprises: list[dict]) -> dict:
                       "include": "siege,matching_etablissements,dirigeants,finances"}
             if cp: params["code_postal"] = cp
             try:
-                resp = await client.get(f"{BASE_URL}/search", params=params)
+                resp = await client.get(f"{ENTREPRISES_BASE_URL}/search", params=params)
                 resp.raise_for_status()
                 results = resp.json().get("results", [])
                 if results:
@@ -189,6 +267,190 @@ async def enrich_batch(entreprises: list[dict]) -> dict:
     found_count = sum(1 for e in enriched if e["found"])
     return {"total": len(enriched), "found": found_count,
             "not_found": len(enriched) - found_count, "results": enriched}
+
+
+@mcp.tool()
+async def geocode_address(
+    adresse: str,
+    ville: Optional[str] = None,
+    code_postal: Optional[str] = None,
+    code_insee: Optional[str] = None,
+    departement: Optional[str] = None,
+    pays: Optional[str] = None,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    index: str = "address",
+    type_resultat: Optional[str] = None,
+    limite: int = 5,
+    source: str = "france",
+) -> dict:
+    """
+    Geocode an address/place/parcel and return latitude/longitude candidates.
+
+    Args:
+        adresse: Address or place to geocode (e.g. "10 avenue des Champs Elysees")
+        ville: Optional city filter or query hint
+        code_postal: Optional postal code filter
+        code_insee: Optional INSEE city code filter
+        departement: Optional department code filter
+        pays: Optional country hint; only used by the global source
+        latitude: Optional latitude used to bias ranking
+        longitude: Optional longitude used to bias ranking
+        index: Geoplateforme indexes: address, poi, parcel, or comma-separated
+        type_resultat: Optional address type: housenumber, street, locality, municipality
+        limite: Max results 1-50, default 5
+        source: "france" for Geoplateforme, "global" for configured Nominatim-compatible
+    """
+    limit = _bounded_limit(limite, 5, MAX_GEOCODING_RESULTS)
+    source_key = source.strip().lower()
+
+    if source_key in ("france", "geoplateforme", "ban"):
+        query = " ".join(part for part in (adresse, ville) if part)
+        params = _compact_params({
+            "q": query,
+            "limit": limit,
+            "autocomplete": "0",
+            "index": index,
+            "postcode": code_postal,
+            "citycode": code_insee,
+            "depcode": departement,
+            "city": ville,
+            "type": type_resultat,
+            "lat": latitude,
+            "lon": longitude,
+        })
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{FR_GEOCODING_BASE_URL}/search", params=params)
+            resp.raise_for_status()
+            data = resp.json()
+
+        features = data.get("features", [])
+        return {
+            "source": "geoplateforme",
+            "query": {
+                "adresse": adresse,
+                "ville": ville,
+                "code_postal": code_postal,
+                "code_insee": code_insee,
+                "departement": departement,
+                "index": index,
+            },
+            "returned": len(features),
+            "results": [_format_geoplateforme_feature(feature) for feature in features],
+        }
+
+    if source_key in ("global", "world", "nominatim"):
+        if not NOMINATIM_BASE_URL or not NOMINATIM_USER_AGENT:
+            return _nominatim_config_error()
+
+        query = " ".join(part for part in (adresse, ville, pays) if part)
+        params = _compact_params({
+            "q": query,
+            "format": "jsonv2",
+            "addressdetails": 1,
+            "limit": limit,
+            "countrycodes": pays.lower() if pays and len(pays) <= 3 else None,
+        })
+        headers = {"User-Agent": NOMINATIM_USER_AGENT}
+
+        async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
+            resp = await client.get(f"{NOMINATIM_BASE_URL}/search", params=params)
+            resp.raise_for_status()
+            places = resp.json()
+
+        return {
+            "source": "nominatim",
+            "query": {"adresse": adresse, "ville": ville, "pays": pays},
+            "returned": len(places),
+            "results": [_format_nominatim_place(place) for place in places],
+        }
+
+    return {"error": f"Unknown geocoding source: {source}"}
+
+
+@mcp.tool()
+async def reverse_geocode(
+    latitude: float,
+    longitude: float,
+    code_postal: Optional[str] = None,
+    code_insee: Optional[str] = None,
+    index: str = "address",
+    type_resultat: Optional[str] = None,
+    limite: int = 5,
+    source: str = "france",
+) -> dict:
+    """
+    Reverse geocode coordinates and return nearest address/place/parcel candidates.
+
+    Args:
+        latitude: Latitude in WGS84
+        longitude: Longitude in WGS84
+        code_postal: Optional postal code filter
+        code_insee: Optional INSEE city code filter
+        index: Geoplateforme indexes: address, poi, parcel, or comma-separated
+        type_resultat: Optional address type: housenumber, street, locality, municipality
+        limite: Max results 1-50, default 5
+        source: "france" for Geoplateforme, "global" for configured Nominatim-compatible
+    """
+    limit = _bounded_limit(limite, 5, MAX_GEOCODING_RESULTS)
+    source_key = source.strip().lower()
+
+    if source_key in ("france", "geoplateforme", "ban"):
+        params = _compact_params({
+            "lat": latitude,
+            "lon": longitude,
+            "limit": limit,
+            "index": index,
+            "postcode": code_postal,
+            "citycode": code_insee,
+            "type": type_resultat,
+        })
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{FR_GEOCODING_BASE_URL}/reverse", params=params)
+            resp.raise_for_status()
+            data = resp.json()
+
+        features = data.get("features", [])
+        return {
+            "source": "geoplateforme",
+            "query": {
+                "latitude": latitude,
+                "longitude": longitude,
+                "code_postal": code_postal,
+                "code_insee": code_insee,
+                "index": index,
+            },
+            "returned": len(features),
+            "results": [_format_geoplateforme_feature(feature) for feature in features],
+        }
+
+    if source_key in ("global", "world", "nominatim"):
+        if not NOMINATIM_BASE_URL or not NOMINATIM_USER_AGENT:
+            return _nominatim_config_error()
+
+        params = {
+            "lat": latitude,
+            "lon": longitude,
+            "format": "jsonv2",
+            "addressdetails": 1,
+        }
+        headers = {"User-Agent": NOMINATIM_USER_AGENT}
+
+        async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
+            resp = await client.get(f"{NOMINATIM_BASE_URL}/reverse", params=params)
+            resp.raise_for_status()
+            place = resp.json()
+
+        return {
+            "source": "nominatim",
+            "query": {"latitude": latitude, "longitude": longitude},
+            "returned": 1 if place else 0,
+            "results": [_format_nominatim_place(place)] if place else [],
+        }
+
+    return {"error": f"Unknown geocoding source: {source}"}
 
 
 async def app(scope, receive, send):
