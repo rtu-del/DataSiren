@@ -187,7 +187,7 @@ def _nominatim_config_error() -> dict:
 
 def _at_headers() -> dict:
     if AIDES_TERRITOIRES_TOKEN:
-        return {"Authorization": f"Bearer {AIDES_TERRITOIRES_TOKEN}"}
+        return {"Authorization": f"Token {AIDES_TERRITOIRES_TOKEN}"}
     return {}
 
 
@@ -743,6 +743,17 @@ async def search_aides_les_aides(
 
     async with httpx.AsyncClient(timeout=15.0, headers=_les_aides_headers()) as client:
         resp = await client.get(f"{LES_AIDES_BASE_URL}/aides", params=params)
+        if resp.status_code == 403:
+            return {
+                "error": "403 Forbidden — les-aides.fr requires at least 3 combined filters for this query. "
+                         "Try adding a domaine (use list_refs_les_aides to get valid IDs) "
+                         "or a filiere alongside region/ape.",
+                "query": _compact_params({
+                    "siren": siren, "ape": ape, "region": region,
+                    "departement": departement, "domaine": domaine,
+                    "filiere": filiere, "moyen": moyen,
+                }),
+            }
         resp.raise_for_status()
         data = resp.json()
 
