@@ -203,10 +203,13 @@ async def _get_at_bearer() -> str:
         )
         resp.raise_for_status()
         data = resp.json()
-    bearer = (
-        data.get("token") or data.get("access") or
-        data.get("bearer_token") or data.get("access_token") or ""
-    )
+    if isinstance(data, str):
+        bearer = data
+    else:
+        bearer = (
+            data.get("token") or data.get("access") or
+            data.get("bearer_token") or data.get("access_token") or ""
+        )
     _AT_BEARER = bearer
     _AT_BEARER_EXPIRES = time.time() + 23 * 3600  # renew 1h before expiry
     return bearer
