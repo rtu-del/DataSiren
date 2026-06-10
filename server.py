@@ -215,7 +215,15 @@ async def _get_at_bearer() -> str:
     return bearer
 
 
-def _format_aide_at(aid: dict) -> dict:
+def _name_list(items) -> list:
+    if not items:
+        return []
+    return [i.get("name") if isinstance(i, dict) else i for i in items]
+
+
+def _format_aide_at(aid) -> dict:
+    if not isinstance(aid, dict):
+        return {"raw": aid}
     return {
         "id": aid.get("id"),
         "name": aid.get("name"),
@@ -223,11 +231,11 @@ def _format_aide_at(aid: dict) -> dict:
         "eligibility": aid.get("eligibility"),
         "status": aid.get("status"),
         "perimeter": aid.get("perimeter"),
-        "aid_types": aid.get("aid_types", []),
-        "audiences": aid.get("aid_audiences", []),
-        "financers": [f.get("name") for f in (aid.get("financers") or [])],
-        "instructors": [f.get("name") for f in (aid.get("instructors") or [])],
-        "categories": [c.get("name") for c in (aid.get("categories") or [])],
+        "aid_types": aid.get("aid_types") or [],
+        "audiences": aid.get("aid_audiences") or [],
+        "financers": _name_list(aid.get("financers")),
+        "instructors": _name_list(aid.get("instructors")),
+        "categories": _name_list(aid.get("categories")),
         "subvention_rate_min": aid.get("subvention_rate_min"),
         "subvention_rate_max": aid.get("subvention_rate_max"),
         "loan_amount": aid.get("loan_amount"),
@@ -621,9 +629,14 @@ async def list_perimetres_at(
         resp.raise_for_status()
         data = resp.json()
 
-    members = data.get("hydra:member") or data.get("results") or (data if isinstance(data, list) else [])
+    if isinstance(data, list):
+        members = data
+    elif isinstance(data, dict):
+        members = data.get("hydra:member") or data.get("results") or []
+    else:
+        members = []
     return {
-        "total": data.get("hydra:totalItems", len(members)),
+        "total": data.get("hydra:totalItems", len(members)) if isinstance(data, dict) else len(members),
         "returned": len(members),
         "perimetres": [
             {
@@ -683,9 +696,14 @@ async def search_aides_territoires(
         resp.raise_for_status()
         data = resp.json()
 
-    members = data.get("hydra:member") or data.get("results") or (data if isinstance(data, list) else [])
+    if isinstance(data, list):
+        members = data
+    elif isinstance(data, dict):
+        members = data.get("hydra:member") or data.get("results") or []
+    else:
+        members = []
     return {
-        "total": data.get("hydra:totalItems", len(members)),
+        "total": data.get("hydra:totalItems", len(members)) if isinstance(data, dict) else len(members),
         "returned": len(members),
         "query": {
             "keyword": keyword,
