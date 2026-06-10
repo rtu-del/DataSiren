@@ -5,6 +5,7 @@ v7
 """
 
 import os
+import time
 import httpx
 import uvicorn
 from typing import Any, Optional
@@ -185,10 +186,30 @@ def _nominatim_config_error() -> dict:
 
 # ── Helpers — Aides-Territoires ────────────────────────────────────────────────
 
-def _at_headers() -> dict:
-    if AIDES_TERRITOIRES_TOKEN:
-        return {"Authorization": f"Token {AIDES_TERRITOIRES_TOKEN}"}
-    return {}
+_AT_BEARER: str = ""
+_AT_BEARER_EXPIRES: float = 0.0
+
+
+async def _get_at_bearer() -> str:
+    global _AT_BEARER, _AT_BEARER_EXPIRES
+    if _AT_BEARER and time.time() < _AT_BEARER_EXPIRES:
+        return _AT_BEARER
+    if not AIDES_TERRITOIRES_TOKEN:
+        return ""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            f"{AT_BASE_URL}/connexion/",
+            headers={"X-AUTH-TOKEN": AIDES_TERRITOIRES_TOKEN},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    bearer = (
+        data.get("token") or data.get("access") or
+        data.get("bearer_token") or data.get("access_token") or ""
+    )
+    _AT_BEARER = bearer
+    _AT_BEARER_EXPIRES = time.time() + 23 * 3600  # renew 1h before expiry
+    return bearer
 
 
 def _format_aide_at(aid: dict) -> dict:
@@ -590,7 +611,9 @@ async def list_perimetres_at(
     if scale:
         params.append(("scale", scale))
 
-    async with httpx.AsyncClient(timeout=10.0, headers=_at_headers()) as client:
+    bearer = await _get_at_bearer()
+    headers = {"Authorization": f"Bearer {bearer}"} if bearer else {}
+    async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
         resp = await client.get(f"{AT_BASE_URL}/perimeters/", params=params)
         resp.raise_for_status()
         data = resp.json()
@@ -650,7 +673,9 @@ async def search_aides_territoires(
     if theme_slug:
         params.append(("category_slugs[]", theme_slug))
 
-    async with httpx.AsyncClient(timeout=15.0, headers=_at_headers()) as client:
+    bearer = await _get_at_bearer()
+    headers = {"Authorization": f"Bearer {bearer}"} if bearer else {}
+    async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
         resp = await client.get(f"{AT_BASE_URL}/aids/", params=params)
         resp.raise_for_status()
         data = resp.json()
