@@ -1,7 +1,7 @@
 """
 MCP Server — Donnees ouvertes France
 Transport : Streamable HTTP stateless (authless, Claude.ai compatible)
-v6
+v7
 """
 
 import os
@@ -12,24 +12,32 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 mcp = FastMCP(
-    name="annuaire-entreprises-fr",
+    name="donnees-ouvertes-france",
     stateless_http=True,
     json_response=True,
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=False,
     ),
     instructions="""
-    French official open data tools for companies and geocoding.
+    French official open data tools for companies, geocoding, public aids, and waste regulation.
     - search_entreprise: find companies by name + optional city/postal code
     - get_entreprise_by_siren: full details by SIREN number
     - enrich_batch: enrich up to 20 companies in one call
     - geocode_address: get coordinates from an address/place/parcel
     - reverse_geocode: get the nearest address/place/parcel from coordinates
-    Never hallucinate company or address data — always use these tools.
+    - search_aides_territoires: search public aids for collectivités/porteurs de projets (Aides-Territoires)
+    - list_perimetres_at: resolve a region/department/commune name to a perimeter code
+    - search_aides_les_aides: search enterprise aids (national + European) via les-aides.fr
+    - get_aide_les_aides: get full detail of an enterprise aid from les-aides.fr
+    - list_refs_les_aides: list valid reference values for les-aides.fr filters (domaines, filieres, etc.)
+    - trackdechets_company: get a company's waste regulatory profile (ICPE, operator types, receipts)
+    - trackdechets_eco_organismes: list registered eco-organisms filtered by waste type
+    Never hallucinate company, address, or aid data — always use these tools.
     """,
 )
 mcp_app = mcp.streamable_http_app()
 
+# --- Entreprises / Géocodage ---
 ENTREPRISES_BASE_URL = "https://recherche-entreprises.api.gouv.fr"
 FR_GEOCODING_BASE_URL = os.environ.get(
     "FR_GEOCODING_BASE_URL",
@@ -39,6 +47,19 @@ NOMINATIM_BASE_URL = os.environ.get("NOMINATIM_BASE_URL", "").rstrip("/")
 NOMINATIM_USER_AGENT = os.environ.get("NOMINATIM_USER_AGENT", "")
 MAX_GEOCODING_RESULTS = 50
 
+# --- Aides-Territoires ---
+AT_BASE_URL = "https://aides-territoires.beta.gouv.fr/api"
+AIDES_TERRITOIRES_TOKEN = os.environ.get("AIDES_TERRITOIRES_TOKEN", "")
+
+# --- les-aides.fr ---
+LES_AIDES_BASE_URL = "https://api.les-aides.fr"
+LES_AIDES_API_KEY = os.environ.get("LES_AIDES_API_KEY", "")
+
+# --- TrackDéchets ---
+TRACKDECHETS_URL = "https://api.trackdechets.beta.gouv.fr/"
+
+
+# ── Helpers — entreprises ──────────────────────────────────────────────────────
 
 def _normalize_naf(code_naf: str) -> str:
     code = code_naf.strip().upper()
@@ -162,6 +183,99 @@ def _nominatim_config_error() -> dict:
     }
 
 
+# ── Helpers — Aides-Territoires ────────────────────────────────────────────────
+
+def _at_headers() -> dict:
+    if AIDES_TERRITOIRES_TOKEN:
+        return {"Authorization": f"Bearer {AIDES_TERRITOIRES_TOKEN}"}
+    return {}
+
+
+def _format_aide_at(aid: dict) -> dict:
+    return {
+        "id": aid.get("id"),
+        "name": aid.get("name"),
+        "description": aid.get("description"),
+        "eligibility": aid.get("eligibility"),
+        "status": aid.get("status"),
+        "perimeter": aid.get("perimeter"),
+        "aid_types": aid.get("aid_types", []),
+        "audiences": aid.get("aid_audiences", []),
+        "financers": [f.get("name") for f in (aid.get("financers") or [])],
+        "instructors": [f.get("name") for f in (aid.get("instructors") or [])],
+        "categories": [c.get("name") for c in (aid.get("categories") or [])],
+        "subvention_rate_min": aid.get("subvention_rate_min"),
+        "subvention_rate_max": aid.get("subvention_rate_max"),
+        "loan_amount": aid.get("loan_amount"),
+        "date_submission_deadline": aid.get("date_submission_deadline"),
+        "date_start": aid.get("date_start"),
+        "origin_url": aid.get("origin_url"),
+        "application_url": aid.get("application_url"),
+        "is_call_for_project": aid.get("is_call_for_project"),
+        "european_aid": aid.get("european_aid"),
+    }
+
+
+# ── Helpers — les-aides.fr ─────────────────────────────────────────────────────
+
+def _les_aides_headers() -> dict:
+    return {"X-IDC": LES_AIDES_API_KEY}
+
+
+# ── Helpers — TrackDéchets ─────────────────────────────────────────────────────
+
+async def _trackdechets_gql(query: str, variables: dict | None = None) -> dict:
+    payload: dict[str, Any] = {"query": query}
+    if variables:
+        payload["variables"] = {k: v for k, v in variables.items() if v is not None}
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(
+            TRACKDECHETS_URL,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    if "errors" in data and data["errors"]:
+        msg = data["errors"][0].get("message", str(data["errors"]))
+        return {"error": msg}
+    return data.get("data", {})
+
+
+def _format_company_td(data: dict) -> dict:
+    installation = data.get("installation") or {}
+    return {
+        "orgId": data.get("orgId"),
+        "siret": data.get("siret"),
+        "vatNumber": data.get("vatNumber"),
+        "name": data.get("name"),
+        "address": data.get("address"),
+        "naf": data.get("naf"),
+        "libelleNaf": data.get("libelleNaf"),
+        "etatAdministratif": data.get("etatAdministratif"),
+        "isRegistered": data.get("isRegistered"),
+        "isDormant": data.get("isDormant"),
+        "companyTypes": data.get("companyTypes", []),
+        "collectorTypes": data.get("collectorTypes") or [],
+        "wasteProcessorTypes": data.get("wasteProcessorTypes") or [],
+        "ecoOrganismeAgreements": data.get("ecoOrganismeAgreements") or [],
+        "transporterReceipt": data.get("transporterReceipt"),
+        "traderReceipt": data.get("traderReceipt"),
+        "brokerReceipt": data.get("brokerReceipt"),
+        "vhuAgrementDemolisseur": data.get("vhuAgrementDemolisseur"),
+        "vhuAgrementBroyeur": data.get("vhuAgrementBroyeur"),
+        "installation": {
+            "codeS3ic": installation.get("codeS3ic"),
+            "urlFiche": installation.get("urlFiche"),
+            "rubriques": installation.get("rubriques") or [],
+            "declarations": installation.get("declarations") or [],
+        } if installation else None,
+        "workerCertification": data.get("workerCertification"),
+    }
+
+
+# ── Tools — Entreprises ────────────────────────────────────────────────────────
+
 @mcp.tool()
 async def search_entreprise(
     nom: str,
@@ -268,6 +382,8 @@ async def enrich_batch(entreprises: list[dict]) -> dict:
     return {"total": len(enriched), "found": found_count,
             "not_found": len(enriched) - found_count, "results": enriched}
 
+
+# ── Tools — Géocodage ──────────────────────────────────────────────────────────
 
 @mcp.tool()
 async def geocode_address(
@@ -452,6 +568,317 @@ async def reverse_geocode(
 
     return {"error": f"Unknown geocoding source: {source}"}
 
+
+# ── Tools — Aides-Territoires ──────────────────────────────────────────────────
+
+@mcp.tool()
+async def list_perimetres_at(
+    q: str,
+    scale: Optional[str] = None,
+    limite: int = 10,
+) -> dict:
+    """
+    Resolve a geographic name to a perimeter code for use in search_aides_territoires.
+
+    Args:
+        q: Name to search (e.g. "Bretagne", "Finistère", "Brest")
+        scale: Optional scale filter: region, department, epci, commune, overseas
+        limite: Max results 1-20, default 10
+    """
+    limit = _bounded_limit(limite, 10, 20)
+    params: list[tuple[str, Any]] = [("q", q), ("limit", limit)]
+    if scale:
+        params.append(("scale", scale))
+
+    async with httpx.AsyncClient(timeout=10.0, headers=_at_headers()) as client:
+        resp = await client.get(f"{AT_BASE_URL}/perimeters/", params=params)
+        resp.raise_for_status()
+        data = resp.json()
+
+    members = data.get("hydra:member") or data.get("results") or (data if isinstance(data, list) else [])
+    return {
+        "total": data.get("hydra:totalItems", len(members)),
+        "returned": len(members),
+        "perimetres": [
+            {
+                "id": p.get("id"),
+                "name": p.get("name"),
+                "code": p.get("code"),
+                "scale": p.get("scale"),
+                "scale_name": p.get("scale_name"),
+                "insee": p.get("insee"),
+                "siren": p.get("siren"),
+            }
+            for p in members
+        ],
+    }
+
+
+@mcp.tool()
+async def search_aides_territoires(
+    keyword: Optional[str] = None,
+    perimeter_code: Optional[str] = None,
+    audience_slug: Optional[str] = None,
+    aid_type_slug: Optional[str] = None,
+    theme_slug: Optional[str] = None,
+    limite: int = 10,
+) -> dict:
+    """
+    Search public aids for collectivités and porteurs de projets (Aides-Territoires).
+
+    Args:
+        keyword: Free text search
+        perimeter_code: INSEE or SIREN code of the territory (get it from list_perimetres_at)
+        audience_slug: Beneficiary type slug, e.g. commune, epci, department, region,
+                       association, private-person, company, farmer
+        aid_type_slug: Aid type slug, e.g. grant, loan, recoverable-advance,
+                       technical-assistance, financial, other
+        theme_slug: Theme/category slug, e.g. biodiversity, energy, mobility, housing,
+                    digital, culture, sport, water, waste, urban-planning
+        limite: Max results 1-50, default 10
+    """
+    limit = _bounded_limit(limite, 10, 50)
+    params: list[tuple[str, Any]] = [("limit", limit)]
+    if keyword:
+        params.append(("keyword", keyword))
+    if perimeter_code:
+        params.append(("perimeter_codes[]", perimeter_code))
+    if audience_slug:
+        params.append(("organization_type_slugs[]", audience_slug))
+    if aid_type_slug:
+        params.append(("aid_type_slugs[]", aid_type_slug))
+    if theme_slug:
+        params.append(("category_slugs[]", theme_slug))
+
+    async with httpx.AsyncClient(timeout=15.0, headers=_at_headers()) as client:
+        resp = await client.get(f"{AT_BASE_URL}/aids/", params=params)
+        resp.raise_for_status()
+        data = resp.json()
+
+    members = data.get("hydra:member") or data.get("results") or (data if isinstance(data, list) else [])
+    return {
+        "total": data.get("hydra:totalItems", len(members)),
+        "returned": len(members),
+        "query": {
+            "keyword": keyword,
+            "perimeter_code": perimeter_code,
+            "audience_slug": audience_slug,
+            "aid_type_slug": aid_type_slug,
+            "theme_slug": theme_slug,
+        },
+        "aides": [_format_aide_at(a) for a in members],
+    }
+
+
+# ── Tools — les-aides.fr ───────────────────────────────────────────────────────
+
+@mcp.tool()
+async def list_refs_les_aides(type: str) -> dict:
+    """
+    List valid reference values for les-aides.fr search filters.
+
+    Args:
+        type: One of: domaines, filieres, regions, departements, moyens
+              - domaines: aid category IDs (use in search_aides_les_aides domaine param)
+              - filieres: business sector slugs (use in filiere param)
+              - regions: region names (use in region param)
+              - departements: department codes (use in departement param)
+              - moyens: intervention method IDs (use in moyen param)
+    """
+    valid = {"domaines", "filieres", "regions", "departements", "moyens"}
+    if type not in valid:
+        return {"error": f"Invalid type '{type}'. Must be one of: {', '.join(sorted(valid))}"}
+    if not LES_AIDES_API_KEY:
+        return {"error": "LES_AIDES_API_KEY environment variable is not set."}
+
+    async with httpx.AsyncClient(timeout=10.0, headers=_les_aides_headers()) as client:
+        resp = await client.get(f"{LES_AIDES_BASE_URL}/liste/{type}")
+        resp.raise_for_status()
+        data = resp.json()
+
+    return {"type": type, "count": len(data) if isinstance(data, list) else None, "values": data}
+
+
+@mcp.tool()
+async def search_aides_les_aides(
+    siren: Optional[str] = None,
+    ape: Optional[str] = None,
+    region: Optional[str] = None,
+    departement: Optional[str] = None,
+    domaine: Optional[int] = None,
+    filiere: Optional[str] = None,
+    moyen: Optional[int] = None,
+) -> dict:
+    """
+    Search enterprise aids (national + European) via les-aides.fr (CCI France database).
+    Use list_refs_les_aides to get valid values for domaine, filiere, region, departement.
+
+    Args:
+        siren: Company SIREN number for personalized results
+        ape: NAF/APE code of the company activity (e.g. "6201Z")
+        region: Region name (e.g. "Bretagne", "Ile-de-France")
+        departement: Department code (e.g. "29", "75")
+        domaine: Aid domain/category ID (integer, from list_refs_les_aides domaines)
+        filiere: Business sector slug (from list_refs_les_aides filieres)
+        moyen: Intervention method ID (integer, from list_refs_les_aides moyens)
+    """
+    if not LES_AIDES_API_KEY:
+        return {"error": "LES_AIDES_API_KEY environment variable is not set."}
+
+    params: list[tuple[str, Any]] = []
+    if siren:
+        params.append(("siren", siren))
+    if ape:
+        params.append(("ape", ape))
+    if region:
+        params.append(("region", region))
+    if departement:
+        params.append(("departement", departement))
+    if domaine is not None:
+        params.append(("domaine", domaine))
+    if filiere:
+        params.append(("filiere", filiere))
+    if moyen is not None:
+        params.append(("moyen", moyen))
+
+    async with httpx.AsyncClient(timeout=15.0, headers=_les_aides_headers()) as client:
+        resp = await client.get(f"{LES_AIDES_BASE_URL}/aides", params=params)
+        resp.raise_for_status()
+        data = resp.json()
+
+    aides = data if isinstance(data, list) else data.get("aides") or data.get("results") or []
+    return {
+        "returned": len(aides),
+        "query": _compact_params({
+            "siren": siren, "ape": ape, "region": region,
+            "departement": departement, "domaine": domaine,
+            "filiere": filiere, "moyen": moyen,
+        }),
+        "aides": aides,
+    }
+
+
+@mcp.tool()
+async def get_aide_les_aides(dispositif: int, requete: Optional[int] = None) -> dict:
+    """
+    Get full details of an enterprise aid from les-aides.fr.
+
+    Args:
+        dispositif: Aid program ID (from search_aides_les_aides results)
+        requete: Optional request context ID (from search_aides_les_aides results, if present)
+    """
+    if not LES_AIDES_API_KEY:
+        return {"error": "LES_AIDES_API_KEY environment variable is not set."}
+
+    params: list[tuple[str, Any]] = [("dispositif", dispositif)]
+    if requete is not None:
+        params.append(("requete", requete))
+
+    async with httpx.AsyncClient(timeout=10.0, headers=_les_aides_headers()) as client:
+        resp = await client.get(f"{LES_AIDES_BASE_URL}/aide", params=params)
+        resp.raise_for_status()
+        data = resp.json()
+
+    return data if isinstance(data, dict) else {"aide": data}
+
+
+# ── Tools — TrackDéchets ───────────────────────────────────────────────────────
+
+_TD_COMPANY_QUERY = """
+query CompanyInfos($siret: String, $clue: String) {
+  companyInfos(siret: $siret, clue: $clue) {
+    orgId siret vatNumber name address naf libelleNaf
+    etatAdministratif isRegistered isDormant
+    companyTypes collectorTypes wasteProcessorTypes
+    ecoOrganismeAgreements
+    transporterReceipt { receiptNumber validityLimit department }
+    traderReceipt { receiptNumber validityLimit department }
+    brokerReceipt { receiptNumber validityLimit department }
+    vhuAgrementDemolisseur { agrementNumber department }
+    vhuAgrementBroyeur { agrementNumber department }
+    installation {
+      codeS3ic urlFiche
+      rubriques { rubrique alinea etatActivite regimeAutorise activite category volume unite }
+      declarations { annee codeDechet libDechet gerepType }
+    }
+    workerCertification {
+      hasSubSectionFour hasSubSectionThree certificationNumber validityLimit organisation
+    }
+  }
+}
+"""
+
+_TD_ECO_QUERY = """
+query EcoOrganismes($handleBsdd: Boolean, $handleBsda: Boolean, $handleBsdasri: Boolean, $handleBsvhu: Boolean) {
+  ecoOrganismes(handleBsdd: $handleBsdd, handleBsda: $handleBsda, handleBsdasri: $handleBsdasri, handleBsvhu: $handleBsvhu) {
+    id name siret address handleBsdd handleBsda handleBsdasri handleBsvhu
+  }
+}
+"""
+
+
+@mcp.tool()
+async def trackdechets_company(
+    siret: Optional[str] = None,
+    clue: Optional[str] = None,
+) -> dict:
+    """
+    Get a company's waste regulatory profile from TrackDéchets (public data, no auth needed).
+    Returns ICPE classifications, GEREP declarations, transporter/trader/broker receipts,
+    VHU agreements, waste operator types, and TrackDéchets registration status.
+
+    Args:
+        siret: 14-digit SIRET of the establishment
+        clue: Intra-community VAT number (alternative to SIRET)
+    """
+    if not siret and not clue:
+        return {"error": "Provide either siret or clue."}
+
+    data = await _trackdechets_gql(
+        _TD_COMPANY_QUERY,
+        {"siret": siret, "clue": clue},
+    )
+    if "error" in data:
+        return data
+    company = data.get("companyInfos")
+    if not company:
+        return {"error": "No company found."}
+    return _format_company_td(company)
+
+
+@mcp.tool()
+async def trackdechets_eco_organismes(
+    handle_bsdd: Optional[bool] = None,
+    handle_bsda: Optional[bool] = None,
+    handle_bsdasri: Optional[bool] = None,
+    handle_bsvhu: Optional[bool] = None,
+) -> dict:
+    """
+    List eco-organisms registered on TrackDéchets (public data, no auth needed).
+    Eco-organisms manage the end-of-life of products under extended producer responsibility.
+
+    Args:
+        handle_bsdd: Filter to eco-organisms handling dangerous waste (BSDD)
+        handle_bsda: Filter to eco-organisms handling asbestos waste (BSDA)
+        handle_bsdasri: Filter to eco-organisms handling healthcare waste (BSDASRI)
+        handle_bsvhu: Filter to eco-organisms handling end-of-life vehicles (BSVHU)
+    """
+    data = await _trackdechets_gql(
+        _TD_ECO_QUERY,
+        {
+            "handleBsdd": handle_bsdd,
+            "handleBsda": handle_bsda,
+            "handleBsdasri": handle_bsdasri,
+            "handleBsvhu": handle_bsvhu,
+        },
+    )
+    if "error" in data:
+        return data
+    orgs = data.get("ecoOrganismes", [])
+    return {"count": len(orgs), "eco_organismes": orgs}
+
+
+# ── ASGI app ───────────────────────────────────────────────────────────────────
 
 async def app(scope, receive, send):
     if scope["type"] == "http" and scope.get("path") == "/health":
