@@ -1,9 +1,14 @@
 """
 MCP Server — Donnees ouvertes France
-Transport : Streamable HTTP stateless (authless, Claude.ai compatible)
-v7
+Transport : Streamable HTTP stateless (Claude.ai compatible)
+Auth entrante optionnelle : HTTP Basic (identifiant/mot de passe) ou bearer/x-api-key.
+Aucun identifiant configure = serveur authless, comme avant.
+v8
 """
 
+import base64
+import hashlib
+import hmac
 import os
 import time
 import httpx
@@ -58,6 +63,108 @@ LES_AIDES_API_KEY = os.environ.get("LES_AIDES_API_KEY", "")
 
 # --- TrackDéchets ---
 TRACKDECHETS_URL = "https://api.trackdechets.beta.gouv.fr/"
+
+# --- Auth entrante (optionnelle) ---
+# Inactive tant qu'aucun identifiant n'est configuré : le serveur reste authless.
+MCP_USERNAME = os.environ.get("MCP_USERNAME", "")
+MCP_PASSWORD = os.environ.get("MCP_PASSWORD", "")
+MCP_PASSWORD_SHA256 = os.environ.get("MCP_PASSWORD_SHA256", "").strip().lower()
+MCP_TOKEN = os.environ.get("MCP_TOKEN", "")
+
+BASIC_AUTH_CONFIGURED = bool(MCP_USERNAME) and bool(MCP_PASSWORD or MCP_PASSWORD_SHA256)
+TOKEN_AUTH_CONFIGURED = bool(MCP_TOKEN)
+AUTH_ENABLED = BASIC_AUTH_CONFIGURED or TOKEN_AUTH_CONFIGURED
+AUTH_REALM = os.environ.get("MCP_AUTH_REALM", "donnees-ouvertes-france")
+
+# Une configuration a moitie renseignee laisserait le serveur ouvert sans le dire :
+# on refuse de demarrer plutot que d'exposer les outils par accident.
+if bool(MCP_USERNAME) != bool(MCP_PASSWORD or MCP_PASSWORD_SHA256):
+    raise RuntimeError(
+        "Incomplete auth config: set MCP_USERNAME together with MCP_PASSWORD_SHA256 "
+        "(or MCP_PASSWORD), or leave all of them unset for an authless server."
+    )
+if MCP_PASSWORD_SHA256 and (
+    len(MCP_PASSWORD_SHA256) != 64
+    or any(char not in "0123456789abcdef" for char in MCP_PASSWORD_SHA256)
+):
+    raise RuntimeError(
+        "MCP_PASSWORD_SHA256 must be a 64-character hex sha256 digest. "
+        "Generate it with: printf '%s' 'your-password' | shasum -a 256"
+    )
+
+
+# ── Helpers — auth entrante ────────────────────────────────────────────────────
+
+def _constant_time_equal(candidate: str, expected: str) -> bool:
+    return hmac.compare_digest(candidate.encode("utf-8"), expected.encode("utf-8"))
+
+
+def _password_matches(candidate: str) -> bool:
+    """MCP_PASSWORD_SHA256 prime sur MCP_PASSWORD si les deux sont definis."""
+    if MCP_PASSWORD_SHA256:
+        digest = hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+        return _constant_time_equal(digest, MCP_PASSWORD_SHA256)
+    if MCP_PASSWORD:
+        return _constant_time_equal(candidate, MCP_PASSWORD)
+    return False
+
+
+def _basic_credentials_valid(credentials: str) -> bool:
+    if not BASIC_AUTH_CONFIGURED:
+        return False
+    try:
+        decoded = base64.b64decode(credentials.strip(), validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return False
+    username, separator, password = decoded.partition(":")
+    if not separator:
+        return False
+    # Les deux comparaisons sont evaluees avant le "and" : un mauvais nom
+    # d'utilisateur coute le meme temps qu'un mauvais mot de passe.
+    username_ok = _constant_time_equal(username, MCP_USERNAME)
+    password_ok = _password_matches(password)
+    return username_ok and password_ok
+
+
+def _token_valid(token: str) -> bool:
+    if not TOKEN_AUTH_CONFIGURED:
+        return False
+    return _constant_time_equal(token.strip(), MCP_TOKEN)
+
+
+def _request_authorized(headers: list) -> bool:
+    """Accepte Authorization: Basic|Bearer, ou x-api-key (clients type Notion)."""
+    authorization = ""
+    api_key = ""
+    for raw_name, raw_value in headers:
+        name = raw_name.lower()
+        if name == b"authorization":
+            authorization = raw_value.decode("latin-1")
+        elif name == b"x-api-key":
+            api_key = raw_value.decode("latin-1")
+
+    if api_key and _token_valid(api_key):
+        return True
+
+    scheme, separator, credentials = authorization.partition(" ")
+    if not separator:
+        return False
+    scheme = scheme.lower()
+    if scheme == "basic":
+        return _basic_credentials_valid(credentials)
+    if scheme == "bearer":
+        return _token_valid(credentials)
+    return False
+
+
+async def _send_json(send, status: int, body: bytes, extra_headers: list = None) -> None:
+    headers = [
+        (b"content-type", b"application/json"),
+        (b"content-length", str(len(body)).encode("ascii")),
+    ]
+    headers.extend(extra_headers or [])
+    await send({"type": "http.response.start", "status": status, "headers": headers})
+    await send({"type": "http.response.body", "body": body})
 
 
 # ── Helpers — entreprises ──────────────────────────────────────────────────────
@@ -944,22 +1051,47 @@ async def trackdechets_eco_organismes(
 # ── ASGI app ───────────────────────────────────────────────────────────────────
 
 async def app(scope, receive, send):
-    if scope["type"] == "http" and scope.get("path") == "/health":
-        body = b'{"status":"ok"}'
-        await send({
-            "type": "http.response.start",
-            "status": 200,
-            "headers": [
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(body)).encode("ascii")),
+    if scope["type"] != "http":
+        await mcp_app(scope, receive, send)
+        return
+
+    # /health reste public : Railway l'interroge sans identifiants.
+    if scope.get("path") == "/health":
+        await _send_json(send, 200, b'{"status":"ok"}')
+        return
+
+    # Le preflight CORS ne transporte pas d'identifiants et ne porte pas de donnees.
+    if AUTH_ENABLED and scope.get("method") != "OPTIONS" \
+            and not _request_authorized(scope.get("headers") or []):
+        await _send_json(
+            send,
+            401,
+            b'{"error":"unauthorized","message":"Valid credentials are required."}',
+            [
+                (b"www-authenticate",
+                 f'Basic realm="{AUTH_REALM}", charset="UTF-8"'.encode("latin-1")),
+                (b"www-authenticate", f'Bearer realm="{AUTH_REALM}"'.encode("latin-1")),
             ],
-        })
-        await send({"type": "http.response.body", "body": body})
+        )
         return
 
     await mcp_app(scope, receive, send)
 
 
 if __name__ == "__main__":
+    if AUTH_ENABLED:
+        methods = []
+        if BASIC_AUTH_CONFIGURED:
+            methods.append(f"basic (user={MCP_USERNAME})")
+        if TOKEN_AUTH_CONFIGURED:
+            methods.append("bearer/x-api-key")
+        print(f"[auth] enabled: {', '.join(methods)}", flush=True)
+    else:
+        print(
+            "[auth] WARNING: no credentials configured, every tool is publicly "
+            "reachable. Set MCP_USERNAME + MCP_PASSWORD_SHA256 (or MCP_TOKEN) "
+            "to require authentication.",
+            flush=True,
+        )
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)

@@ -5,7 +5,7 @@ Serveur MCP qui expose des APIs officielles françaises en open data :
 - Annuaire des entreprises : `recherche-entreprises.api.gouv.fr`
 - Géocodage : `data.geopf.fr/geocodage`
 
-Par défaut, aucune clé API n'est requise.
+Par défaut, aucune clé API n'est requise et le serveur est ouvert. Voir [Authentification entrante](#authentification-entrante-optionnelle) pour le protéger par identifiant/mot de passe ou par token.
 
 ## Outils disponibles
 
@@ -54,6 +54,62 @@ NOMINATIM_USER_AGENT="mcp-datagouv/1.0 contact@example.com"
 Puis appelez `geocode_address` ou `reverse_geocode` avec `"source": "global"`.
 
 Note : le service public `nominatim.openstreetmap.org` impose des limites fortes et ne doit pas être utilisé comme géocodeur générique sans décision explicite et respect de sa politique d'usage.
+
+## Authentification entrante (optionnelle)
+
+Par défaut le serveur est **authless** : n'importe qui connaissant l'URL peut appeler les outils. Pour le protéger, deux méthodes sont acceptées simultanément.
+
+| Variable | Rôle |
+|---|---|
+| `MCP_USERNAME` | Identifiant HTTP Basic |
+| `MCP_PASSWORD_SHA256` | Empreinte sha256 (64 caractères hex) du mot de passe — **recommandé** |
+| `MCP_PASSWORD` | Mot de passe en clair (alternative ; ignoré si l'empreinte est définie) |
+| `MCP_TOKEN` | Token statique accepté en `Authorization: Bearer <token>` ou `x-api-key: <token>` |
+| `MCP_AUTH_REALM` | Realm annoncé dans `WWW-Authenticate` (défaut : `donnees-ouvertes-france`) |
+
+Générer l'empreinte :
+
+```bash
+printf '%s' 'ton-mot-de-passe' | shasum -a 256
+```
+
+Règles de comportement :
+
+- Aucune variable définie → serveur authless, avertissement au démarrage.
+- `MCP_USERNAME` sans mot de passe (ou l'inverse) → **le serveur refuse de démarrer**, pour éviter une exposition silencieuse.
+- `/health` reste toujours public : le healthcheck Railway n'envoie pas d'identifiants.
+- Les comparaisons se font en temps constant ; un mauvais identifiant coûte le même temps qu'un mauvais mot de passe.
+- Un refus renvoie `401` avec les challenges `Basic` et `Bearer`.
+
+Test en local :
+
+```bash
+export MCP_USERNAME=romus
+export MCP_PASSWORD_SHA256=$(printf '%s' 's3cr3t' | shasum -a 256 | cut -d' ' -f1)
+python server.py
+
+curl -u romus:s3cr3t -X POST http://localhost:8000/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
+```
+
+### Connecter le serveur à Notion
+
+Les connexions MCP personnalisées Notion demandent un plan **Business ou Enterprise**, et un admin du workspace doit d'abord activer `Settings → Connections → onglet Manage → Enable custom MCP servers`.
+
+Ensuite, dans l'agent : `Settings → Tools & Access → Add connection → Custom MCP server`, puis renseigner l'URL `https://ton-service.railway.app/mcp`, un nom d'affichage, et les identifiants (`MCP_USERNAME` / mot de passe si Notion propose un couple identifiant-mot de passe, sinon `MCP_TOKEN` dans le champ clé d'API ou bearer token).
+
+### Conséquence sur le connecteur Claude.ai
+
+Claude.ai négocie l'autorisation en OAuth et n'offre pas de champ identifiant/mot de passe ni de header personnalisé. **Dès que des identifiants sont configurés, le connecteur Claude.ai reçoit un 401 et cesse de fonctionner.** Les clients en ligne de commande restent utilisables :
+
+```bash
+claude mcp add --transport http datasiren https://ton-service.railway.app/mcp \
+  --header "Authorization: Bearer $MCP_TOKEN"
+```
+
+Pour garder Claude.ai, il faudrait implémenter un serveur d'autorisation OAuth 2.1 avec enregistrement dynamique de client (DCR) — non fait ici.
 
 ## Complément Sirene INSEE
 
