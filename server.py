@@ -1,7 +1,7 @@
 """
 MCP Server — Donnees ouvertes France
-Transport : Streamable HTTP stateless (authless, Claude.ai compatible)
-v7
+Transport : Streamable HTTP stateless (authless, Claude/ChatGPT compatible)
+v8
 """
 
 import os
@@ -9,16 +9,43 @@ import time
 import httpx
 import uvicorn
 from typing import Any, Optional
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
+from starlette.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
-mcp = FastMCP(
+
+def _csv_env(name: str) -> list[str]:
+    """Parse a comma-separated environment variable, ignoring empty values."""
+    return [value.strip() for value in os.environ.get(name, "").split(",") if value.strip()]
+
+
+def _transport_security() -> TransportSecuritySettings:
+    """Build DNS-rebinding allowlists without hard-coding the Railway domain."""
+    allowed_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+    railway_public_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+    if railway_public_domain:
+        allowed_hosts.append(railway_public_domain)
+    allowed_hosts.extend(_csv_env("MCP_ALLOWED_HOSTS"))
+
+    allowed_origins = _csv_env("MCP_ALLOWED_ORIGINS") or [
+        "https://chatgpt.com",
+        "https://chat.openai.com",
+        "https://claude.ai",
+        "http://127.0.0.1:*",
+        "http://localhost:*",
+    ]
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=list(dict.fromkeys(allowed_hosts)),
+        allowed_origins=list(dict.fromkeys(allowed_origins)),
+    )
+
+
+mcp = MCPServer(
     name="donnees-ouvertes-france",
-    stateless_http=True,
-    json_response=True,
-    transport_security=TransportSecuritySettings(
-        enable_dns_rebinding_protection=False,
-    ),
+    version=os.environ.get("MCP_SERVER_VERSION", "1.0.0"),
     instructions="""
     French official open data tools for companies, geocoding, public aids, and waste regulation.
     - search_entreprise: find companies by name + optional city/postal code
@@ -36,7 +63,6 @@ mcp = FastMCP(
     Never hallucinate company, address, or aid data — always use these tools.
     """,
 )
-mcp_app = mcp.streamable_http_app()
 
 # --- Entreprises / Géocodage ---
 ENTREPRISES_BASE_URL = "https://recherche-entreprises.api.gouv.fr"
@@ -624,7 +650,7 @@ async def list_perimetres_at(
         limite: Max results 1-20, default 10
     """
     limit = _bounded_limit(limite, 10, 20)
-    params: list[tuple[str, Any]] = [("q", q), ("limit", limit)]
+    params: list[tuple[str, Any]] = [("q", q), ("itemsPerPage", limit)]
     if scale:
         params.append(("scale", scale))
 
@@ -641,6 +667,7 @@ async def list_perimetres_at(
         members = data.get("hydra:member") or data.get("results") or []
     else:
         members = []
+    members = members[:limit]
     return {
         "total": data.get("hydra:totalItems", len(members)) if isinstance(data, dict) else len(members),
         "returned": len(members),
@@ -683,17 +710,17 @@ async def search_aides_territoires(
         limite: Max results 1-50, default 10
     """
     limit = _bounded_limit(limite, 10, 50)
-    params: list[tuple[str, Any]] = [("limit", limit)]
+    params: list[tuple[str, Any]] = [("itemsPerPage", limit)]
     if keyword:
         params.append(("keyword", keyword))
     if perimeter_code:
-        params.append(("perimeter_codes[]", perimeter_code))
+        params.append(("perimeter_codes", perimeter_code))
     if audience_slug:
-        params.append(("organization_type_slugs[]", audience_slug))
+        params.append(("organization_type_slugs", audience_slug))
     if aid_type_slug:
-        params.append(("aid_type_slugs[]", aid_type_slug))
+        params.append(("aid_type_slugs", aid_type_slug))
     if theme_slug:
-        params.append(("category_slugs[]", theme_slug))
+        params.append(("category_slugs", theme_slug))
 
     bearer = await _get_at_bearer()
     headers = {"Authorization": f"Bearer {bearer}"} if bearer else {}
@@ -708,6 +735,7 @@ async def search_aides_territoires(
         members = data.get("hydra:member") or data.get("results") or []
     else:
         members = []
+    members = members[:limit]
     return {
         "total": data.get("hydra:totalItems", len(members)) if isinstance(data, dict) else len(members),
         "returned": len(members),
@@ -943,21 +971,27 @@ async def trackdechets_eco_organismes(
 
 # ── ASGI app ───────────────────────────────────────────────────────────────────
 
-async def app(scope, receive, send):
-    if scope["type"] == "http" and scope.get("path") == "/health":
-        body = b'{"status":"ok"}'
-        await send({
-            "type": "http.response.start",
-            "status": 200,
-            "headers": [
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(body)).encode("ascii")),
-            ],
-        })
-        await send({"type": "http.response.body", "body": body})
-        return
+@mcp.custom_route("/health", methods=["GET"])
+async def health(_: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok"})
 
-    await mcp_app(scope, receive, send)
+
+mcp_app = mcp.streamable_http_app(
+    stateless_http=True,
+    json_response=True,
+    transport_security=_transport_security(),
+)
+
+# Claude et ChatGPT appellent normalement le MCP cote serveur. Ce middleware
+# permet aussi les clients navigateur et MCP Inspector ; la validation Origin
+# effective reste assuree par TransportSecuritySettings sur la requete MCP.
+app = CORSMiddleware(
+    mcp_app,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["Mcp-Session-Id"],
+)
 
 
 if __name__ == "__main__":

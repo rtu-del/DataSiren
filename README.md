@@ -5,7 +5,8 @@ Serveur MCP qui expose des APIs officielles françaises en open data :
 - Annuaire des entreprises : `recherche-entreprises.api.gouv.fr`
 - Géocodage : `data.geopf.fr/geocodage`
 
-Par défaut, aucune clé API n'est requise.
+Cette branche expose un serveur public sans authentification entrante. Les clés
+des services tiers restent optionnelles selon les outils utilisés.
 
 ## Outils disponibles
 
@@ -84,14 +85,26 @@ Ou via l'interface Railway : **New Project → Deploy from GitHub repo**.
 
 Railway détecte automatiquement le Dockerfile et expose le service sur une URL publique du type `https://xxx.railway.app`.
 
-### 3. Connecter à Claude
+Le serveur utilise automatiquement la variable Railway `RAILWAY_PUBLIC_DOMAIN`
+pour autoriser son hostname sans le coder en dur. Variables optionnelles :
 
-Dans les paramètres MCP de Claude.ai, ajouter :
+| Variable | Rôle |
+|---|---|
+| `MCP_ALLOWED_HOSTS` | Hostnames supplémentaires, séparés par des virgules (domaines personnalisés) |
+| `MCP_ALLOWED_ORIGINS` | Origins navigateur autorisées, séparées par des virgules |
+| `MCP_SERVER_VERSION` | Version annoncée aux clients MCP (défaut : `1.0.0`) |
+
+### 3. Connecter à Claude ou ChatGPT
+
+Ajouter un serveur MCP distant avec :
 
 ```
 URL : https://ton-service.railway.app/mcp
-Nom : annuaire-entreprises-fr
+Nom : donnees-ouvertes-france
 ```
+
+Le point d'entrée doit être l'URL HTTPS terminée par `/mcp`, par exemple
+`https://datasiren-production-7252.up.railway.app/mcp`.
 
 ## Données retournées
 
