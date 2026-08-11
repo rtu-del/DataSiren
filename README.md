@@ -5,7 +5,10 @@ Serveur MCP qui expose des APIs officielles françaises en open data :
 - Annuaire des entreprises : `recherche-entreprises.api.gouv.fr`
 - Géocodage : `data.geopf.fr/geocodage`
 
-Par défaut, aucune clé API n'est requise et le serveur est ouvert. Voir [Authentification entrante](#authentification-entrante-optionnelle) pour le protéger par identifiant/mot de passe ou par token.
+Par défaut, le serveur est public sans authentification entrante. Voir
+[Authentification entrante](#authentification-entrante-optionnelle) pour le
+protéger par identifiant/mot de passe ou par token. Les clés des services tiers
+restent optionnelles selon les outils utilisés.
 
 ## Outils disponibles
 
@@ -94,22 +97,19 @@ curl -u romus:s3cr3t -X POST http://localhost:8000/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
 ```
 
-### Connecter le serveur à Notion
+### Compatibilité des clients MCP
 
-Les connexions MCP personnalisées Notion demandent un plan **Business ou Enterprise**, et un admin du workspace doit d'abord activer `Settings → Connections → onglet Manage → Enable custom MCP servers`.
-
-Ensuite, dans l'agent : `Settings → Tools & Access → Add connection → Custom MCP server`, puis renseigner l'URL `https://ton-service.railway.app/mcp`, un nom d'affichage, et les identifiants (`MCP_USERNAME` / mot de passe si Notion propose un couple identifiant-mot de passe, sinon `MCP_TOKEN` dans le champ clé d'API ou bearer token).
-
-### Conséquence sur le connecteur Claude.ai
-
-Claude.ai négocie l'autorisation en OAuth et n'offre pas de champ identifiant/mot de passe ni de header personnalisé. **Dès que des identifiants sont configurés, le connecteur Claude.ai reçoit un 401 et cesse de fonctionner.** Les clients en ligne de commande restent utilisables :
+L'authentification statique fonctionne avec les clients qui permettent d'ajouter
+un en-tête HTTP personnalisé. Exemple avec un token :
 
 ```bash
 claude mcp add --transport http datasiren https://ton-service.railway.app/mcp \
   --header "Authorization: Bearer $MCP_TOKEN"
 ```
 
-Pour garder Claude.ai, il faudrait implémenter un serveur d'autorisation OAuth 2.1 avec enregistrement dynamique de client (DCR) — non fait ici.
+Cette branche n'implémente pas OAuth. Un client qui exige la découverte et le
+flux OAuth MCP standard ne pourra donc pas utiliser l'authentification statique
+ci-dessus ; laissez le serveur authless ou ajoutez une implémentation OAuth.
 
 ## Complément Sirene INSEE
 
@@ -140,14 +140,27 @@ Ou via l'interface Railway : **New Project → Deploy from GitHub repo**.
 
 Railway détecte automatiquement le Dockerfile et expose le service sur une URL publique du type `https://xxx.railway.app`.
 
-### 3. Connecter à Claude
+Le serveur utilise automatiquement la variable Railway `RAILWAY_PUBLIC_DOMAIN`
+pour autoriser son hostname sans le coder en dur. Variables optionnelles :
 
-Dans les paramètres MCP de Claude.ai, ajouter :
+| Variable | Rôle |
+|---|---|
+| `MCP_ALLOWED_HOSTS` | Hostnames supplémentaires, séparés par des virgules (domaines personnalisés) |
+| `MCP_ALLOWED_ORIGINS` | Origins navigateur autorisées, séparées par des virgules |
+| `MCP_SERVER_VERSION` | Version annoncée aux clients MCP (défaut : `1.0.0`) |
+
+### 3. Connecter un client MCP
+
+Ajouter un serveur MCP distant avec :
 
 ```
 URL : https://ton-service.railway.app/mcp
-Nom : annuaire-entreprises-fr
+Nom : donnees-ouvertes-france
 ```
+
+Le point d'entrée doit être l'URL HTTPS terminée par `/mcp`. Si l'authentification
+est active, configurez le client avec HTTP Basic, `Authorization: Bearer ...` ou
+`x-api-key`. Le client doit permettre les en-têtes personnalisés.
 
 ## Données retournées
 
