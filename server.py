@@ -9,6 +9,7 @@ v9
 import base64
 import hashlib
 import hmac
+import logging
 import os
 import time
 import httpx
@@ -19,6 +20,9 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+
+
+logger = logging.getLogger("datasiren")
 
 
 def _csv_env(name: str) -> list[str]:
@@ -391,6 +395,37 @@ def _format_aide_at(aid) -> dict:
 
 def _les_aides_headers() -> dict:
     return {"X-IDC": LES_AIDES_API_KEY}
+
+
+def _les_aides_error(resp: httpx.Response, query: dict) -> dict:
+    """Preserve upstream diagnostics instead of guessing why a request failed."""
+    raw_body = resp.text.strip()
+    logger.warning(
+        "les-aides.fr upstream error: status=%s body=%r",
+        resp.status_code,
+        raw_body,
+    )
+
+    result: dict[str, Any] = {
+        "error": f"les-aides.fr returned HTTP {resp.status_code}.",
+        "upstream_status": resp.status_code,
+        "upstream_response": raw_body,
+        "query": query,
+        "filter_count": len(query),
+    }
+    diagnostic_headers = {
+        name: value
+        for name, value in resp.headers.items()
+        if name.lower() in {
+            "retry-after",
+            "x-ratelimit-limit",
+            "x-ratelimit-remaining",
+            "x-ratelimit-reset",
+        }
+    }
+    if diagnostic_headers:
+        result["upstream_headers"] = diagnostic_headers
+    return result
 
 
 # ── Helpers — TrackDéchets ─────────────────────────────────────────────────────
@@ -867,8 +902,8 @@ async def list_refs_les_aides(type: str) -> dict:
     Args:
         type: One of: domaines, filieres, regions, departements, moyens
               - domaines: aid category IDs (use in search_aides_les_aides domaine param)
-              - filieres: business sector slugs (use in filiere param)
-              - regions: region names (use in region param)
+              - filieres: business sector IDs (use in filiere param)
+              - regions: numeric INSEE region IDs (use in region param)
               - departements: department codes (use in departement param)
               - moyens: intervention method IDs (use in moyen param)
     """
@@ -888,12 +923,12 @@ async def list_refs_les_aides(type: str) -> dict:
 
 @mcp.tool()
 async def search_aides_les_aides(
-    siren: Optional[str] = None,
-    ape: Optional[str] = None,
-    region: Optional[str] = None,
+    ape: str,
+    domaine: int,
+    region: Optional[int] = None,
     departement: Optional[str] = None,
-    domaine: Optional[int] = None,
-    filiere: Optional[str] = None,
+    commune: Optional[str] = None,
+    filiere: Optional[int] = None,
     moyen: Optional[int] = None,
 ) -> dict:
     """
@@ -901,80 +936,96 @@ async def search_aides_les_aides(
     Use list_refs_les_aides to get valid values for domaine, filiere, region, departement.
 
     Args:
-        siren: Company SIREN number for personalized results
-        ape: NAF/APE code of the company activity (e.g. "6201Z")
-        region: Region name (e.g. "Bretagne", "Ile-de-France")
+        ape: Required NAF/APE code of the company activity (e.g. "6201Z")
+        domaine: Required aid domain ID (integer, from list_refs_les_aides domaines)
+        region: Numeric INSEE region ID (e.g. 11 for Ile-de-France, not its name)
         departement: Department code (e.g. "29", "75")
-        domaine: Aid domain/category ID (integer, from list_refs_les_aides domaines)
-        filiere: Business sector slug (from list_refs_les_aides filieres)
+        commune: INSEE commune code, optionally used with departement
+        filiere: Business sector ID (integer, from list_refs_les_aides filieres)
         moyen: Intervention method ID (integer, from list_refs_les_aides moyens)
     """
     if not LES_AIDES_API_KEY:
         return {"error": "LES_AIDES_API_KEY environment variable is not set."}
 
     params: list[tuple[str, Any]] = []
-    if siren:
-        params.append(("siren", siren))
-    if ape:
-        params.append(("ape", ape))
+    params.append(("ape", ape))
+    params.append(("domaine", domaine))
     if region:
         params.append(("region", region))
     if departement:
         params.append(("departement", departement))
-    if domaine is not None:
-        params.append(("domaine", domaine))
-    if filiere:
+    if commune:
+        params.append(("commune", commune))
+    if filiere is not None:
         params.append(("filiere", filiere))
     if moyen is not None:
         params.append(("moyen", moyen))
 
+    query = _compact_params({
+        "ape": ape, "domaine": domaine, "region": region,
+        "departement": departement, "commune": commune,
+        "filiere": filiere, "moyen": moyen,
+    })
+
     async with httpx.AsyncClient(timeout=15.0, headers=_les_aides_headers()) as client:
-        resp = await client.get(f"{LES_AIDES_BASE_URL}/aides", params=params)
-        if resp.status_code == 403:
-            return {
-                "error": "403 Forbidden — les-aides.fr requires at least 3 combined filters for this query. "
-                         "Try adding a domaine (use list_refs_les_aides to get valid IDs) "
-                         "or a filiere alongside region/ape.",
-                "query": _compact_params({
-                    "siren": siren, "ape": ape, "region": region,
-                    "departement": departement, "domaine": domaine,
-                    "filiere": filiere, "moyen": moyen,
-                }),
-            }
-        resp.raise_for_status()
+        resp = await client.get(f"{LES_AIDES_BASE_URL}/aides/", params=params)
+        if not resp.is_success:
+            return _les_aides_error(resp, query)
         data = resp.json()
 
-    aides = data if isinstance(data, list) else data.get("aides") or data.get("results") or []
+    if isinstance(data, dict):
+        aides = data.get("dispositifs") or data.get("aides") or data.get("results") or []
+        request_id = data.get("idr")
+        total = data.get("nb_dispositifs", len(aides))
+        limit_exceeded = data.get("depassement", False)
+    elif isinstance(data, list):
+        aides = data
+        request_id = None
+        total = len(aides)
+        limit_exceeded = False
+    else:
+        aides = []
+        request_id = None
+        total = 0
+        limit_exceeded = False
+
     return {
+        "request_id": request_id,
+        "total": total,
         "returned": len(aides),
-        "query": _compact_params({
-            "siren": siren, "ape": ape, "region": region,
-            "departement": departement, "domaine": domaine,
-            "filiere": filiere, "moyen": moyen,
-        }),
+        "limit_exceeded": limit_exceeded,
+        "query": query,
+        "date": data.get("date") if isinstance(data, dict) else None,
+        "localisation": data.get("localisation") if isinstance(data, dict) else None,
+        "etablissement": data.get("etablissement") if isinstance(data, dict) else None,
         "aides": aides,
     }
 
 
 @mcp.tool()
-async def get_aide_les_aides(dispositif: int, requete: Optional[int] = None) -> dict:
+async def get_aide_les_aides(dispositif: int, requete: int) -> dict:
     """
     Get full details of an enterprise aid from les-aides.fr.
 
     Args:
-        dispositif: Aid program ID (from search_aides_les_aides results)
-        requete: Optional request context ID (from search_aides_les_aides results, if present)
+        dispositif: Aid program ID (`numero` from search_aides_les_aides results)
+        requete: Required request context ID (`request_id` from search_aides_les_aides)
     """
     if not LES_AIDES_API_KEY:
         return {"error": "LES_AIDES_API_KEY environment variable is not set."}
 
-    params: list[tuple[str, Any]] = [("dispositif", dispositif)]
-    if requete is not None:
-        params.append(("requete", requete))
+    params: list[tuple[str, Any]] = [
+        ("requete", requete),
+        ("dispositif", dispositif),
+    ]
 
     async with httpx.AsyncClient(timeout=10.0, headers=_les_aides_headers()) as client:
-        resp = await client.get(f"{LES_AIDES_BASE_URL}/aide", params=params)
-        resp.raise_for_status()
+        resp = await client.get(f"{LES_AIDES_BASE_URL}/aide/", params=params)
+        if not resp.is_success:
+            return _les_aides_error(
+                resp,
+                {"requete": requete, "dispositif": dispositif},
+            )
         data = resp.json()
 
     return data if isinstance(data, dict) else {"aide": data}
