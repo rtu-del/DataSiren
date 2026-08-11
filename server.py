@@ -4,6 +4,7 @@ Transport : Streamable HTTP stateless (authless, Claude/ChatGPT compatible)
 v8
 """
 
+import logging
 import os
 import time
 import httpx
@@ -14,6 +15,9 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+
+
+logger = logging.getLogger("datasiren")
 
 
 def _csv_env(name: str) -> list[str]:
@@ -284,6 +288,37 @@ def _format_aide_at(aid) -> dict:
 
 def _les_aides_headers() -> dict:
     return {"X-IDC": LES_AIDES_API_KEY}
+
+
+def _les_aides_error(resp: httpx.Response, query: dict) -> dict:
+    """Preserve upstream diagnostics instead of guessing why a request failed."""
+    raw_body = resp.text.strip()
+    logger.warning(
+        "les-aides.fr upstream error: status=%s body=%r",
+        resp.status_code,
+        raw_body,
+    )
+
+    result: dict[str, Any] = {
+        "error": f"les-aides.fr returned HTTP {resp.status_code}.",
+        "upstream_status": resp.status_code,
+        "upstream_response": raw_body,
+        "query": query,
+        "filter_count": len(query),
+    }
+    diagnostic_headers = {
+        name: value
+        for name, value in resp.headers.items()
+        if name.lower() in {
+            "retry-after",
+            "x-ratelimit-limit",
+            "x-ratelimit-remaining",
+            "x-ratelimit-reset",
+        }
+    }
+    if diagnostic_headers:
+        result["upstream_headers"] = diagnostic_headers
+    return result
 
 
 # ── Helpers — TrackDéchets ─────────────────────────────────────────────────────
@@ -821,30 +856,23 @@ async def search_aides_les_aides(
     if moyen is not None:
         params.append(("moyen", moyen))
 
+    query = _compact_params({
+        "siren": siren, "ape": ape, "region": region,
+        "departement": departement, "domaine": domaine,
+        "filiere": filiere, "moyen": moyen,
+    })
+
     async with httpx.AsyncClient(timeout=15.0, headers=_les_aides_headers()) as client:
         resp = await client.get(f"{LES_AIDES_BASE_URL}/aides", params=params)
-        if resp.status_code == 403:
-            return {
-                "error": "403 Forbidden — les-aides.fr requires at least 3 combined filters for this query. "
-                         "Try adding a domaine (use list_refs_les_aides to get valid IDs) "
-                         "or a filiere alongside region/ape.",
-                "query": _compact_params({
-                    "siren": siren, "ape": ape, "region": region,
-                    "departement": departement, "domaine": domaine,
-                    "filiere": filiere, "moyen": moyen,
-                }),
-            }
+        if not resp.is_success:
+            return _les_aides_error(resp, query)
         resp.raise_for_status()
         data = resp.json()
 
     aides = data if isinstance(data, list) else data.get("aides") or data.get("results") or []
     return {
         "returned": len(aides),
-        "query": _compact_params({
-            "siren": siren, "ape": ape, "region": region,
-            "departement": departement, "domaine": domaine,
-            "filiere": filiere, "moyen": moyen,
-        }),
+        "query": query,
         "aides": aides,
     }
 
